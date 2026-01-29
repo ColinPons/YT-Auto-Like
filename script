@@ -1,0 +1,186 @@
+// ==UserScript==
+// @name         YT Auto-Like at 60s (Auto + User-Gesture Fallback)
+// @namespace    vm-colin/autolike
+// @version      2.5
+// @description  Auto-like at <=60s remaining. Handles SPA, view-model button, multiple activation strategies, and a minimal on-screen fallback.
+// @match        https://www.youtube.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  var THRESHOLD = 60;          // seconds remaining
+  var RENDER_GRACE_MS = 1200;  // wait after nav
+  var POLL_MS = 500;           // timing poll
+  var likedThisVideo = false;
+  var currentVideoId = null;
+  var pollTimer = null;
+
+  // ---------- helpers ----------
+  function getVideoId() {
+    try {
+      var u = new URL(location.href);
+      return u.pathname === '/watch' ? u.searchParams.get('v') : null;
+    } catch (e) { return null; }
+  }
+  function videoEl() { return document.querySelector('video'); }
+
+  function findLikeButton() {
+    return (
+      document.querySelector('like-button-view-model button[aria-pressed]') ||
+      document.querySelector('#segmented-like-button button[aria-pressed]') ||
+      document.querySelector('ytd-like-button-renderer button[aria-pressed]') ||
+      document.querySelector('button[aria-pressed][aria-label*="ike" i]') ||
+      null
+    );
+  }
+
+  function isLiked(btn) { return btn && btn.getAttribute('aria-pressed') === 'true'; }
+  function isEnabled(btn) { return btn && btn.getAttribute('aria-disabled') !== 'true'; }
+
+  function scrollIntoViewCenter(el) {
+    try { el.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch (e) {}
+  }
+
+  function tryPointerClick(el) {
+    try {
+      scrollIntoViewCenter(el);
+      if (el.focus) el.focus();
+      var seq = [
+        ['pointerdown', { bubbles: true }],
+        ['mousedown',   { bubbles: true }],
+        ['mouseup',     { bubbles: true }],
+        ['click',       { bubbles: true }]
+      ];
+      var E;
+      for (var i = 0; i < seq.length; i++) {
+        var name = seq[i][0], opts = seq[i][1];
+        if (name.indexOf('pointer') === 0 && window.PointerEvent) E = PointerEvent;
+        else if (window.MouseEvent) E = MouseEvent;
+        else E = Event;
+        el.dispatchEvent(new E(name, opts));
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function tryKeyboardActivate(el) {
+    try {
+      scrollIntoViewCenter(el);
+      if (el.focus) el.focus();
+      var keys = [' ', 'Enter'];
+      for (var i = 0; i < keys.length; i++) {
+        ['keydown', 'keyup', 'keypress'].forEach(function (type) {
+          el.dispatchEvent(new KeyboardEvent(type, { key: keys[i], bubbles: true }));
+        });
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function tryDoubleClick(el) {
+    try {
+      scrollIntoViewCenter(el);
+      if (el.focus) el.focus();
+      el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // Minimal UI prompt shown only if auto attempts fail
+  function ensurePrompt(onConfirm) {
+    var id = 'yt-autolike-prompt';
+    var existing = document.getElementById(id);
+    if (existing) return existing;
+    var btn = document.createElement('button');
+    btn.id = id;
+    btn.textContent = 'Like now';
+    btn.style.cssText = [
+      'position:fixed','right:16px','bottom:16px','z-index:999999',
+      'font:600 12px/1.2 system-ui,Arial,sans-serif',
+      'padding:8px 10px','border-radius:8px','border:1px solid #ccc',
+      'background:#fff','color:#111','box-shadow:0 2px 10px rgba(0,0,0,.15)',
+      'cursor:pointer','opacity:.95'
+    ].join(';');
+    btn.addEventListener('click', function () {
+      try { onConfirm(); } catch (e) {}
+      btn.remove();
+    });
+    document.documentElement.appendChild(btn);
+    return btn;
+  }
+
+  function attemptLikeNow() {
+    var btn = findLikeButton();
+    if (!btn || !isEnabled(btn)) return false;
+
+    if (!isLiked(btn)) {
+      // Try several activation paths
+      if (!tryPointerClick(btn)) { /* ignore */ }
+      // Give DOM a tick to update aria-pressed
+      if (!isLiked(btn)) tryKeyboardActivate(btn);
+      if (!isLiked(btn)) tryDoubleClick(btn);
+    }
+    return isLiked(btn);
+  }
+
+  function monitor() {
+    var v = videoEl();
+    if (!v) return;
+
+    likedThisVideo = false;
+
+    function maybeLike() {
+      var vv = videoEl();
+      if (!vv || isNaN(vv.duration) || vv.duration <= 0) return;
+      var remaining = vv.duration - vv.currentTime;
+
+      if (!likedThisVideo && remaining <= THRESHOLD && remaining > 0) {
+        // First: fully automatic attempts
+        if (attemptLikeNow()) {
+          likedThisVideo = true;
+          return;
+        }
+        // If auto failed, show a one-tap prompt to use your trusted gesture
+        ensurePrompt(function () {
+          if (attemptLikeNow()) likedThisVideo = true;
+        });
+      }
+    }
+
+    // Start polling + listen to timeupdate
+    v.addEventListener('timeupdate', maybeLike);
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(maybeLike, POLL_MS);
+
+    // Re-seek controls if player re-renders
+    var player = document.querySelector('#movie_player') || document.body;
+    var mo = new MutationObserver(function () {
+      if (!likedThisVideo && !document.contains(findLikeButton())) {
+        setTimeout(maybeLike, 250);
+      }
+    });
+    mo.observe(player, { childList: true, subtree: true });
+  }
+
+  function onNavigate() {
+    var id = getVideoId();
+    if (!id || id === currentVideoId) return;
+    currentVideoId = id;
+    likedThisVideo = false;
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    setTimeout(monitor, RENDER_GRACE_MS);
+  }
+
+  // SPA routing hooks
+  window.addEventListener('yt-navigate-finish', onNavigate);
+  var last = location.href;
+  setInterval(function () {
+    if (location.href !== last) { last = location.href; onNavigate(); }
+  }, 400);
+
+  // Boot
+  onNavigate();
+})();
